@@ -291,7 +291,7 @@ impl Json2Csv {
     /// When set to `true`, headers will appear in the order they are first encountered in the JSON objects.
     /// When set to `false` (default), headers will be sorted alphabetically.
     #[must_use]
-    pub fn preserve_key_order(mut self, preserve: bool) -> Self {
+    pub const fn preserve_key_order(mut self, preserve: bool) -> Self {
         self.preserve_key_order = preserve;
         self
     }

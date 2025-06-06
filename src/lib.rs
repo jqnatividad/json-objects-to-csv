@@ -146,6 +146,42 @@
 //!#     Ok(())
 //!# }
 //! ```
+//!
+//! ### Example preserving key order
+//!
+//!```rust
+//!# use std::error::Error;
+//!#
+//!# fn main() -> Result<(), Box<dyn Error>> {
+//!#
+//! use csv;
+//! use flatten_json_object::Flattener;
+//! use json_objects_to_csv::Json2Csv;
+//! use serde_json::json;
+//! use std::str;
+//!
+//! let flattener = Flattener::new();
+//! let mut output = Vec::<u8>::new();
+//!
+//! let input = [
+//!     json!({"price": 2.50, "fruit": "apple"}),
+//!     json!({"price": 3.00, "fruit": "banana"})
+//! ];
+//!
+//! let csv_writer = csv::Writer::from_writer(&mut output);
+//!
+//! // By default, headers are sorted alphabetically: "fruit,price"
+//! // With preserve_key_order(true), headers maintain original order: "price,fruit"
+//! Json2Csv::new(flattener)
+//!     .preserve_key_order(true)
+//!     .convert_from_array(&input, csv_writer)?;
+//!
+//! let expected = ["price,fruit", "2.5,apple", "3.0,banana"];
+//! assert_eq!(str::from_utf8(&output)?, expected.join("\n") + "\n");
+//!#
+//!#     Ok(())
+//!# }
+//! ```
 
 use flatten_json_object::ArrayFormatting;
 use serde_json::{Deserializer, Value};
@@ -163,6 +199,55 @@ pub use flatten_json_object;
 
 mod error;
 
+/// Collection of headers that can be either sorted (BTreeSet) or ordered (Vec).
+#[derive(Clone, Debug)]
+enum HeaderCollection {
+    /// Headers sorted alphabetically
+    Sorted(BTreeSet<String>),
+    /// Headers in insertion order
+    Ordered(Vec<String>),
+}
+
+impl HeaderCollection {
+    /// Insert a header into the collection
+    fn insert(&mut self, key: String) {
+        match self {
+            HeaderCollection::Sorted(set) => {
+                set.insert(key);
+            }
+            HeaderCollection::Ordered(vec) => {
+                if !vec.contains(&key) {
+                    vec.push(key);
+                }
+            }
+        }
+    }
+
+    /// Check if the collection is empty
+    fn is_empty(&self) -> bool {
+        match self {
+            HeaderCollection::Sorted(set) => set.is_empty(),
+            HeaderCollection::Ordered(vec) => vec.is_empty(),
+        }
+    }
+
+    /// Get the length of the collection
+    fn len(&self) -> usize {
+        match self {
+            HeaderCollection::Sorted(set) => set.len(),
+            HeaderCollection::Ordered(vec) => vec.len(),
+        }
+    }
+
+    /// Iterate over the headers in their respective order
+    fn iter(&self) -> Box<dyn Iterator<Item = &String> + '_> {
+        match self {
+            HeaderCollection::Sorted(set) => Box::new(set.iter()),
+            HeaderCollection::Ordered(vec) => Box::new(vec.iter()),
+        }
+    }
+}
+
 /// Basic struct of this crate. It contains the configuration.Instantiate it and use the method
 /// `convert_from_array` or `convert_from_file` to convert the JSON input into a CSV file.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +256,8 @@ pub struct Json2Csv {
     flattener: flatten_json_object::Flattener,
     /// The flattener provided by the user of the library.
     original_flattener: flatten_json_object::Flattener,
+    /// Whether to preserve the original order of keys instead of sorting them alphabetically.
+    preserve_key_order: bool,
 }
 
 impl Json2Csv {
@@ -195,7 +282,18 @@ impl Json2Csv {
                     }),
             },
             original_flattener: flattener,
+            preserve_key_order: false,
         }
+    }
+
+    /// Sets whether to preserve the original order of keys instead of sorting them alphabetically.
+    /// 
+    /// When set to `true`, headers will appear in the order they are first encountered in the JSON objects.
+    /// When set to `false` (default), headers will be sorted alphabetically.
+    #[must_use]
+    pub fn preserve_key_order(mut self, preserve: bool) -> Self {
+        self.preserve_key_order = preserve;
+        self
     }
 
     /// The library uses internally a different key separator and potentially array formatting
@@ -225,12 +323,20 @@ impl Json2Csv {
         }
     }
 
+
+
     /// Collects headers from all objects in a single pass.
     /// Returns a tuple of (transformed_headers, original_headers).
-    fn collect_headers(&self, objects: &[Value]) -> Result<(BTreeSet<String>, BTreeSet<String>), error::Error> {
+    /// The order of headers depends on the `preserve_key_order` setting.
+    fn collect_headers(&self, objects: &[Value]) -> Result<(HeaderCollection, BTreeSet<String>), error::Error> {
         let mut orig_headers = BTreeSet::new();
-        let mut headers = BTreeSet::new();
+        let mut headers = if self.preserve_key_order {
+            HeaderCollection::Ordered(Vec::new())
+        } else {
+            HeaderCollection::Sorted(BTreeSet::new())
+        };
         
+        // Process objects to collect headers in the appropriate order
         for obj in objects {
             let flattened = self.flattener.flatten(obj)?;
             if let Value::Object(map) = flattened {
@@ -289,7 +395,7 @@ impl Json2Csv {
             return Err(Error::FlattenedKeysCollision);
         }
 
-        csv_writer.write_record(&headers)?;
+        csv_writer.write_record(headers.iter())?;
         
         // Process objects in streaming fashion - no intermediate collections
         for obj in objects {
@@ -326,10 +432,14 @@ impl Json2Csv {
         // resulting in the same headers.
         let mut tmp_file = BufWriter::new(tempfile()?);
 
-        // The headers are the union of the keys of the flattened objects, sorted.
+        // The headers are the union of the keys of the flattened objects.
         // We collect the headers with our magic separators, and the headers with the separators that the user requested.
         let mut orig_headers = BTreeSet::<String>::new();
-        let mut headers = BTreeSet::<String>::new();
+        let mut headers = if self.preserve_key_order {
+            HeaderCollection::Ordered(Vec::new())
+        } else {
+            HeaderCollection::Sorted(BTreeSet::new())
+        };
 
         for obj in Deserializer::from_reader(reader).into_iter::<Value>() {
             let obj = obj?; // Ensure that we can parse the input properly
@@ -362,7 +472,7 @@ impl Json2Csv {
         tmp_file.seek(SeekFrom::Start(0))?;
         let tmp_file = BufReader::new(tmp_file.into_inner()?);
 
-        csv_writer.write_record(&headers)?;
+        csv_writer.write_record(headers.iter())?;
         for obj in Deserializer::from_reader(tmp_file).into_iter::<Value>() {
             let Value::Object(map) = obj? else {
                 unreachable!("Flattening a JSON object always produces a JSON object");
@@ -375,11 +485,11 @@ impl Json2Csv {
 }
 
 fn build_record(
-    headers: &BTreeSet<String>,
+    headers: &HeaderCollection,
     mut map: serde_json::Map<String, Value>,
 ) -> Vec<String> {
     let mut record: Vec<String> = vec![];
-    for header in headers {
+    for header in headers.iter() {
         if let Some(val) = map.remove(header) {
             match val {
                 Value::String(s) => record.push(s),
@@ -628,5 +738,126 @@ mod tests {
         let result = execute(input, &flattener);
 
         assert_eq!(result.output, expected.join("\n") + "\n");
+    }
+
+    #[test]
+    fn preserve_key_order_default_is_sorted() {
+        let input = r#"{"price": 2.50, "fruit": "apple"}{"price": 3.00, "fruit": "banana"}"#;
+        let flattener = Flattener::new()
+            .set_key_separator(".")
+            .set_array_formatting(ArrayFormatting::Plain)
+            .set_preserve_empty_arrays(false)
+            .set_preserve_empty_objects(false);
+        
+        // Default behavior should sort headers alphabetically
+        let result = execute(input, &flattener);
+        let expected = &["fruit,price", "apple,2.5", "banana,3.0"];
+        assert_eq!(result.output, expected.join("\n") + "\n");
+    }
+
+    #[test]  
+    fn preserve_key_order_when_enabled() {
+        let input = r#"{"price": 2.50, "fruit": "apple"}{"price": 3.00, "fruit": "banana"}"#;
+        let flattener = Flattener::new()
+            .set_key_separator(".")
+            .set_array_formatting(ArrayFormatting::Plain)
+            .set_preserve_empty_arrays(false)
+            .set_preserve_empty_objects(false);
+
+        // Test with key order preservation enabled
+        let mut output_from_array = Vec::<u8>::new();
+        let csv_writer_from_array = csv::WriterBuilder::new()
+            .delimiter(b',')
+            .from_writer(&mut output_from_array);
+
+        let input_from_array: Result<Vec<_>, _> =
+            Deserializer::from_str(input).into_iter::<Value>().collect();
+        let input_from_array = input_from_array.unwrap();
+
+        Json2Csv::new(flattener.clone())
+            .preserve_key_order(true)
+            .convert_from_array(&input_from_array, csv_writer_from_array)
+            .unwrap();
+
+        let output_from_array = std::str::from_utf8(&output_from_array).unwrap();
+        
+        // Headers should be in original order: price,fruit (not sorted fruit,price)
+        let expected = &["price,fruit", "2.5,apple", "3.0,banana"];
+        assert_eq!(output_from_array, expected.join("\n") + "\n");
+    }
+
+    #[test]
+    fn preserve_key_order_with_reader() {
+        let input = r#"{"price": 2.50, "fruit": "apple"}{"price": 3.00, "fruit": "banana"}"#;
+        let flattener = Flattener::new()
+            .set_key_separator(".")
+            .set_array_formatting(ArrayFormatting::Plain)
+            .set_preserve_empty_arrays(false)
+            .set_preserve_empty_objects(false);
+
+        // Test with key order preservation using reader
+        let mut output = Vec::<u8>::new();
+        let csv_writer = csv::WriterBuilder::new()
+            .delimiter(b',')
+            .from_writer(&mut output);
+
+        Json2Csv::new(flattener)
+            .preserve_key_order(true)
+            .convert_from_reader(input.as_bytes(), csv_writer)
+            .unwrap();
+
+        let output = std::str::from_utf8(&output).unwrap();
+        
+        // Headers should be in original order: price,fruit (not sorted fruit,price)
+        let expected = &["price,fruit", "2.5,apple", "3.0,banana"];
+        assert_eq!(output, expected.join("\n") + "\n");
+    }
+
+    #[test]
+    fn preserve_key_order_with_complex_nesting() {
+        let input = r#"{"z": {"y": 1}, "a": {"x": 2}}{"z": {"y": 3}, "a": {"x": 4}}"#;
+        let flattener = Flattener::new()
+            .set_key_separator(".")
+            .set_array_formatting(ArrayFormatting::Plain)
+            .set_preserve_empty_arrays(false)
+            .set_preserve_empty_objects(false);
+
+        // Test with preserve_key_order = true
+        let mut output_ordered = Vec::<u8>::new();
+        let csv_writer_ordered = csv::WriterBuilder::new()
+            .delimiter(b',')
+            .from_writer(&mut output_ordered);
+
+        let input_array: Result<Vec<_>, _> =
+            Deserializer::from_str(input).into_iter::<Value>().collect();
+        let input_array = input_array.unwrap();
+
+        Json2Csv::new(flattener.clone())
+            .preserve_key_order(true)
+            .convert_from_array(&input_array, csv_writer_ordered)
+            .unwrap();
+
+        let output_ordered = std::str::from_utf8(&output_ordered).unwrap();
+        
+        // Headers should be in original order: z.y,a.x (not sorted a.x,z.y)
+        let expected_ordered = &["z.y,a.x", "1,2", "3,4"];
+        assert_eq!(output_ordered, expected_ordered.join("\n") + "\n");
+
+        // Test with preserve_key_order = false (default) for comparison
+        let mut output_sorted = Vec::<u8>::new();
+        let csv_writer_sorted = csv::WriterBuilder::new()
+            .delimiter(b',')
+            .from_writer(&mut output_sorted);
+
+        Json2Csv::new(flattener)
+            .preserve_key_order(false)
+            .convert_from_array(&input_array, csv_writer_sorted)
+            .unwrap();
+
+        let output_sorted = std::str::from_utf8(&output_sorted).unwrap();
+        
+        // Headers should be sorted: a.x,z.y
+        let expected_sorted = &["a.x,z.y", "2,1", "4,3"];
+        assert_eq!(output_sorted, expected_sorted.join("\n") + "\n");
     }
 }

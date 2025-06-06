@@ -318,9 +318,8 @@ impl Json2Csv {
             let obj = obj?; // Ensure that we can parse the input properly
             let obj = self.flattener.flatten(&obj)?;
 
-            let orig_map = match obj {
-                Value::Object(map) => map,
-                _ => unreachable!("Flattening a JSON object always produces a JSON object"),
+            let Value::Object(orig_map) = obj else {
+                unreachable!("Flattening a JSON object always produces a JSON object");
             };
 
             let mut map = BTreeMap::new();
@@ -348,9 +347,8 @@ impl Json2Csv {
 
         csv_writer.write_record(&headers)?;
         for obj in Deserializer::from_reader(tmp_file).into_iter::<Value>() {
-            let map = match obj? {
-                Value::Object(map) => map,
-                _ => unreachable!("Flattening a JSON object always produces a JSON object"),
+            let Value::Object(map) = obj? else {
+                unreachable!("Flattening a JSON object always produces a JSON object");
             };
             csv_writer.write_record(build_record(&headers, map))?;
         }
@@ -374,10 +372,10 @@ fn build_record(
                 // otherwise. In addition, to reach this for arrays and objects the flattener must
                 // have been set to preserve them when empty. Makes no sense to add them or `Null`
                 // to the CSV output, so we replace them with the empty string.
-                Value::Null | Value::Array(_) | Value::Object(_) => record.push("".to_string()),
+                Value::Null | Value::Array(_) | Value::Object(_) => record.push(String::new()),
             }
         } else {
-            record.push("".to_string());
+            record.push(String::new());
         }
     }
     record

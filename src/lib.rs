@@ -225,6 +225,38 @@ impl Json2Csv {
         }
     }
 
+    /// Collects headers from all objects in a single pass.
+    /// Returns a tuple of (transformed_headers, original_headers).
+    fn collect_headers(&self, objects: &[Value]) -> Result<(BTreeSet<String>, BTreeSet<String>), error::Error> {
+        let mut orig_headers = BTreeSet::new();
+        let mut headers = BTreeSet::new();
+        
+        for obj in objects {
+            let flattened = self.flattener.flatten(obj)?;
+            if let Value::Object(map) = flattened {
+                for (orig_key, _) in map {
+                    let key = self.transform_key(&orig_key);
+                    orig_headers.insert(orig_key);
+                    headers.insert(key);
+                }
+            } else {
+                unreachable!("Flattening a JSON object always produces a JSON object");
+            }
+        }
+        
+        Ok((headers, orig_headers))
+    }
+
+    /// Transforms a map using the original-to-transformed key mapping.
+    fn transform_map(&self, orig_map: serde_json::value::Map<String, Value>) -> serde_json::value::Map<String, Value> {
+        let mut map = serde_json::value::Map::new();
+        for (orig_key, value) in orig_map {
+            let key = self.transform_key(&orig_key);
+            map.insert(key, value);
+        }
+        map
+    }
+
     /// Flattens each one of the objects in the array slice and transforms each of them into a CSV
     /// row.
     ///
@@ -240,36 +272,13 @@ impl Json2Csv {
         objects: &[Value],
         mut csv_writer: csv::Writer<impl Write>,
     ) -> Result<(), error::Error> {
-        // We have to flatten the JSON object since there is no other way to convert nested objects to CSV
-        let mut orig_flat_maps = Vec::<serde_json::value::Map<String, Value>>::new();
-
-        for obj in objects {
-            let obj = self.flattener.flatten(obj)?;
-            if let Value::Object(map) = obj {
-                orig_flat_maps.push(map);
-            } else {
-                unreachable!("Flattening a JSON object always produces a JSON object");
-            }
-        }
-        let orig_flat_maps = orig_flat_maps;
-
-        let mut flat_maps = Vec::<serde_json::value::Map<String, Value>>::new();
-
-        // The headers are the union of the keys of the flattened objects, sorted.
-        // We collect the headers with our magic separators, and the headers with the separators that the user requested.
-        let mut orig_headers = BTreeSet::<String>::new();
-        let mut headers = BTreeSet::<String>::new();
-        for orig_map in orig_flat_maps {
-            let mut map = serde_json::value::Map::new();
-            for (orig_key, value) in orig_map {
-                let key = self.transform_key(&orig_key);
-                map.insert(key.clone(), value);
-                orig_headers.insert(orig_key);
-                headers.insert(key);
-            }
-            flat_maps.push(map);
+        if objects.is_empty() {
+            return Ok(());
         }
 
+        // Collect headers in first pass
+        let (headers, orig_headers) = self.collect_headers(objects)?;
+        
         // If we could not extract headers there is nothing to write to the CSV file
         if headers.is_empty() {
             return Ok(());
@@ -281,8 +290,16 @@ impl Json2Csv {
         }
 
         csv_writer.write_record(&headers)?;
-        for map in flat_maps {
-            csv_writer.write_record(build_record(&headers, map))?;
+        
+        // Process objects in streaming fashion - no intermediate collections
+        for obj in objects {
+            let flattened = self.flattener.flatten(obj)?;
+            if let Value::Object(orig_map) = flattened {
+                let map = self.transform_map(orig_map);
+                csv_writer.write_record(build_record(&headers, map))?;
+            } else {
+                unreachable!("Flattening a JSON object always produces a JSON object");
+            }
         }
 
         Ok(())
